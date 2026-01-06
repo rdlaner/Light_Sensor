@@ -1,18 +1,21 @@
-"""Ambient Light Sensor Application"""
+"""Ambient Light Sensor Application
+
+# TODO: Add ping operation to validate channel instead of scanning on every boot
+"""
 # pylint: disable=import-outside-toplevel
 
 # Standard imports
 import io
 import machine
 import sys
-import time
-from machine import I2C, Pin, RTC
+from machine import I2C, Pin
 from micropython import const
 
 # Third party imports
 from homeassistant.device import HomeAssistantDevice
 from homeassistant.device_class import DeviceClass
 from homeassistant.sensor import HomeAssistantSensor
+from mp_libs import event_sm
 from mp_libs import logging
 from mp_libs.enum import Enum
 from mp_libs.memory import BackupDict, BackupList
@@ -22,7 +25,7 @@ from mp_libs.power import powerfeather
 from mp_libs.power import lc709204f as fg
 from mp_libs.time import ptp
 from mp_libs.sensors import veml7700
-from mp_libs.sleep import deep_sleep, light_sleep
+from mp_libs.sleep import light_sleep
 
 # Local imports
 from config import config
@@ -47,26 +50,73 @@ if config["log_to_buffer"]:
     backup_logs = BackupList(offset=BACKUP_RAM_SIZE_BYTES)
     backup_logs.clear()
     buffer_handler = logging.BufferHandler(backup_logs)
-    buffer_handler.setLevel(logging.CRITICAL)
+    buffer_handler.setLevel(config["buffer_logging_level"])
     buffer_handler.setFormatter(logging.Formatter("%(mono)d %(levelname)s-%(name)s:%(message)s"))
     logging.getLogger().addHandler(buffer_handler)
 
 
 class DeviceState(Enum):
-    STATE_LIGHT_SLEEP = const(0)
-    STATE_DEEP_SLEEP_SAMPLING = const(1)
-    STATE_DEEP_SLEEP = const(2)
+    LUX_SAMPLING = const(0)
+    ALL_SAMPLING = const(1)
 
 
-def backup_ram_init(is_usb_connected: bool):
+class StateAll(event_sm.InterfaceState):
+    """All sensor sampling state"""
+    def __init__(
+        self,
+        ha_device: HomeAssistantDevice
+    ):
+        super().__init__("All")
+        self.ha_device = ha_device
+
+    def entry(self):
+        logger.info("Reading all sensors...")
+        self.ha_device.read_sensors()
+
+        logger.info("Publishing sensor data...")
+        self.ha_device.publish_sensors()
+
+    def exit(self):
+        # Transition to next state on next iteration
+        backup_ram[BACKUP_NAME_STATE] = DeviceState.LUX_SAMPLING
+
+
+class StateLux(event_sm.InterfaceState):
+    """Lux sampling state"""
+    def __init__(
+        self,
+        ha_sensor: HomeAssistantSensor,
+        ha_device: HomeAssistantDevice,
+        total_iterations: int
+    ):
+        super().__init__("Lux")
+        self.ha_sensor = ha_sensor
+        self.ha_device = ha_device
+        self.total_iterations = total_iterations
+        self.iteration = total_iterations
+
+    def entry(self):
+        logger.info("Reading lux sensor...")
+        self.ha_device.read(self.ha_sensor)
+
+        logger.info("Publishing sensor data...")
+        self.ha_device.publish_sensors()
+
+        if self.iteration > 0:
+            self.iteration -= 1
+
+    def exit(self):
+        if self.iteration == 0:
+            # Transition to next state on next iteration
+            self.iteration = self.total_iterations
+            backup_ram[BACKUP_NAME_STATE] = DeviceState.ALL_SAMPLING
+
+
+def backup_ram_init():
     """Initialize persistent data"""
     logger.info("Initializing backup RAM...")
     backup_ram.reset()
-
-    if is_usb_connected:
-        backup_ram[BACKUP_NAME_STATE] = DeviceState.STATE_LIGHT_SLEEP
-    else:
-        backup_ram[BACKUP_NAME_STATE] = DeviceState.STATE_DEEP_SLEEP_SAMPLING
+    backup_ram[BACKUP_NAME_STATE] = DeviceState.LUX_SAMPLING
 
 
 def backup_ram_is_valid() -> bool:
@@ -124,7 +174,8 @@ def reset(msg: str = "", exc_info=None) -> None:
     raise RuntimeError(msg)
 
 
-def main():
+def main():  # pylint: disable=too-many-locals,too-many-statements
+    """Main loop"""
     # Wake reasoning
     first_boot = machine.reset_cause() in [machine.PWRON_RESET, machine.HARD_RESET]
     logger.info(f"Reset cause: {machine.reset_cause()}")
@@ -133,7 +184,8 @@ def main():
 
     # Board init
     logger.debug("Board init...")
-    pf = powerfeather.PowerFeather(batt_type=powerfeather.BatteryType.GENERIC_3V7, batt_cap=1050)
+    pf = powerfeather.PowerFeather(batt_type=powerfeather.BatteryType.GENERIC_3V7, batt_cap=config["batt_cap"])
+    pf.batt_charging_enable(True)
 
     def cb_button(pin: Pin) -> None:
         print("Button Pressed! Toggling charging.")
@@ -149,17 +201,16 @@ def main():
     # Backup RAM
     logger.debug("Backup RAM...")
     if first_boot:
-        backup_ram_init(pf.is_usb_connected())
+        backup_ram_init()
     elif not backup_ram_is_valid():
-        backup_ram_init(pf.is_usb_connected())
+        backup_ram_init()
 
     # Sensors init
     logger.debug("Sensors init...")
     lux_i2c = I2C(1, scl=Pin.board.I2C_SCL1, sda=Pin.board.I2C_SDA1, freq=400000)
     lux_sensor = veml7700.VEML7700(lux_i2c)
-    logger.debug(f"Lux gain:             {lux_sensor.gain(veml7700.ALS_GAIN_1_8)}")
-    logger.debug(f"Lux integration time: {lux_sensor.integration_time(veml7700.ALS_50MS)}")
-    logger.debug(f"Lux resolution:       {lux_sensor.resolution()}")
+    lux_sensor.gain(veml7700.ALS_GAIN_1_8)
+    lux_sensor.integration_time(veml7700.ALS_50MS)
 
     # Network init
     net = network_init()
@@ -172,10 +223,6 @@ def main():
         logger.exception("Network scan failed", exc_info=exc)
     else:
         backup_ram["pc"] = peer_channel
-
-    if config["log_to_buffer"]:
-        # Adjust log level now that scan is done (it's noisy)
-        buffer_handler.setLevel(config["buffer_logging_level"])
 
     # Sync with master
     # TODO: Only sync periodically, no need on every boot cycle (if we are using deep sleep)
@@ -224,30 +271,30 @@ def main():
     ha_device.add_sensor(ha_sensor_batt_time)
     ha_device.send_discovery()
 
-    term_current = pf._charger.term_current
-    batt_voltage = batt_charge = batt_cycles = batt_health = batt_time_left = 0
+    # Setup state table - order must match DeviceState enum vals
+    state_table = [
+        StateLux(ha_sensor_lux, ha_device, config["lux_cycles"]),
+        StateAll(ha_device)
+    ]
+
     logger.info("Starting light reading...")
     while True:
         pf.led_on()
-        net.disconnect()
         net.connect()
 
-        try:
-            # Get data
-            logger.info("Reading sensors...")
-            ha_device.read_sensors()
+        state_id = backup_ram[BACKUP_NAME_STATE]
+        curr_state = state_table[state_id]
 
-            # Send data
-            ha_device.publish_sensors()
-            if config["log_to_buffer"]:
-                logger.info("Sending logs...")
+        curr_state.entry()
+        curr_state.exit()
 
-                # Copy out and clear logs first in case any additional logs are generated during publish
-                logs = backup_logs.copy()
-                backup_logs.clear()
-                ha_device.publish_logs(logs, recover=True)
-        except Exception as exc:
-            reset("Caught unexpected exception. Rebooting.", exc_info=exc)
+        if config["log_to_buffer"]:
+            # Copy out and clear logs first in case any additional logs are generated during publish
+            logger.info("Sending logs...")
+            logs = backup_logs.copy()
+            backup_logs.clear()
+            ha_device.publish_logs(logs, recover=True)
 
+        net.disconnect()
         pf.led_off()
-        light_sleep(10, lambda: config["fake_sleep"])
+        light_sleep(config["light_sleep_sec"], lambda: config["fake_sleep"])
